@@ -7,7 +7,7 @@ import httpx
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 
-from config import TELEGRAM_BOT_TOKEN, GROQ_API_KEY
+from config import TELEGRAM_BOT_TOKEN, GROQ_API_KEY, OPENAI_API_KEY
 
 # Хранение настроек пользователей (user_id -> mode)
 user_settings: dict[int, str] = {}
@@ -62,13 +62,13 @@ DEFAULT_MODE = None  # Пока не выбран режим
 
 
 async def transcribe_audio(audio_bytes: bytes) -> str:
-    """Транскрибация аудио через Groq Whisper API"""
+    """Транскрибация аудио через OpenAI Whisper API"""
     async with httpx.AsyncClient(timeout=60.0) as client:
         response = await client.post(
-            "https://api.groq.com/openai/v1/audio/transcriptions",
-            headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+            "https://api.openai.com/v1/audio/transcriptions",
+            headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
             files={"file": ("audio.ogg", audio_bytes, "audio/ogg")},
-            data={"model": "whisper-large-v3-turbo", "language": "ru"}
+            data={"model": "whisper-1", "language": "ru"}
         )
         response.raise_for_status()
         return response.json()["text"]
