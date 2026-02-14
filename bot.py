@@ -1,5 +1,5 @@
 """
-Telegram бот-транскрибатор с 3 режимами обработки
+Telegram бот-транскрибатор с режимами обработки и кастомными промптами
 """
 import asyncio
 import tempfile
@@ -9,8 +9,18 @@ from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQu
 
 from config import TELEGRAM_BOT_TOKEN, GROQ_API_KEY, OPENAI_API_KEY
 
-# Хранение настроек пользователей (user_id -> mode)
+# Хранение настроек пользователей (user_id -> mode string)
+# Для кастомного промпта: "custom_prompt:0", "custom_prompt:1", "custom_prompt:2"
 user_settings: dict[int, str] = {}
+
+# Хранение кастомных промптов пользователей (user_id -> list of {"name": ..., "prompt": ...})
+# Максимум 3 на пользователя
+user_custom_prompts: dict[int, list[dict]] = {}
+
+# Состояние ожидания ввода (user_id -> {"action": "awaiting_name"/"awaiting_prompt", "name": ...})
+user_pending_action: dict[int, dict] = {}
+
+MAX_CUSTOM_PROMPTS = 3
 
 # Глобальная инструкция для всех режимов
 GLOBAL_INSTRUCTION = """
@@ -32,29 +42,10 @@ MODES = {
         "description": "Убираю междометия, разделяю на абзацы. Конструктивный тон в стиле инфостиля Ильяхова.",
         "prompt": "Отредактируй текст: убери междометия и слова-паразиты, раздели на абзацы, исправь грамматику. Сохрани эмоции, интонацию и характер автора — текст должен звучать живо, как написанный от руки. Тон — конструктивный. Не пиши слишком формально, не создавай лишней дистанции с читателем, но обходись без панибратства. Чаще используй глаголы, опирайся на «инфостиль» Максима Ильяхова. Верни только отредактированный текст."
     },
-    "notes": {
-        "name": "📋 Заметки/сообщения",
-        "short": "Заметки/сообщения",
-        "description": "Конструктивный тон в стиле инфостиля Ильяхова. Подойдёт для отправки сообщения коллеге или текстовой заметки для себя.",
-        "prompt": """Преобразуй в качественную структурированную заметку.
-
-КРИТИЧЕСКИ ВАЖНО - ФОРМАТИРОВАНИЕ:
-- ИСПОЛЬЗУЙ ТОЛЬКО HTML ТЕГИ: <b>жирный</b> и <i>курсив</i>
-- НИКОГДА НЕ ИСПОЛЬЗУЙ Markdown! Запрещено: **текст**, *текст*, __текст__
-- Используй • для списков (НЕ *, НЕ -)
-- Используй эмодзи: 📌, ✅, 💡, 📝, ⚡
-- ВСЕГДА ставь ПРОБЕЛ после эмодзи перед текстом или тегами!
-  ✓ Правильно: "✅ <b>Выводы:</b>" 
-  ✗ Неправильно: "✅<b>Выводы:</b>" или "✅ **Выводы:**"
-- Разделяй абзацы пустой строкой
-
-СТРУКТУРА:
-1. 📌 <b>Краткий заголовок заметки</b>
-2. <b>Ключевые мысли:</b> (списком с •)
-3. ✅ <b>Выводы или действия</b> (если есть)
-
-Тон — конструктивный. Не пиши слишком формально, не создавай лишней дистанции с читателем, но обходись без панибратства. Чаще используй глаголы, опирайся на «инфостиль» Максима Ильяхова.
-Верни ТОЛЬКО готовую заметку, используя ТОЛЬКО HTML теги для форматирования."""
+    "custom_prompt": {
+        "name": "🎯 Свой промпт",
+        "short": "Свой промпт",
+        "description": "Создай свои правила обработки текста (до 3 промптов)."
     }
 }
 
@@ -74,9 +65,19 @@ async def transcribe_audio(audio_bytes: bytes) -> str:
         return response.json()["text"]
 
 
-async def process_with_llm(text: str, mode: str) -> str:
+async def process_with_llm(text: str, mode: str, user_id: int = None) -> str:
     """Обработка текста через Groq LLM"""
-    system_prompt = GLOBAL_INSTRUCTION + "\n" + MODES[mode]["prompt"]
+    if mode.startswith("custom_prompt:"):
+        # Кастомный промпт — берём из пользовательских данных
+        idx = int(mode.split(":")[1])
+        prompts = user_custom_prompts.get(user_id, [])
+        if idx < len(prompts):
+            user_prompt = prompts[idx]["prompt"]
+        else:
+            user_prompt = "Исправь текст."
+        system_prompt = GLOBAL_INSTRUCTION + "\n" + user_prompt
+    else:
+        system_prompt = GLOBAL_INSTRUCTION + "\n" + MODES[mode]["prompt"]
     
     async with httpx.AsyncClient(timeout=60.0) as client:
         response = await client.post(
@@ -109,6 +110,27 @@ def get_mode_selection_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(buttons)
 
 
+def get_custom_prompts_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    """Клавиатура выбора кастомного промпта"""
+    buttons = []
+    prompts = user_custom_prompts.get(user_id, [])
+    
+    for i, p in enumerate(prompts):
+        buttons.append([InlineKeyboardButton(
+            f"📄 {p['name']}", 
+            callback_data=f"use_custom:{i}"
+        )])
+    
+    # Кнопка "Создать новый" — только если меньше максимума
+    if len(prompts) < MAX_CUSTOM_PROMPTS:
+        buttons.append([InlineKeyboardButton(
+            "➕ Создать новый промпт", 
+            callback_data="new_custom"
+        )])
+    
+    return InlineKeyboardMarkup(buttons)
+
+
 def get_change_mode_keyboard() -> ReplyKeyboardMarkup:
     """Постоянная кнопка смены режима"""
     return ReplyKeyboardMarkup(
@@ -124,12 +146,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Сбрасываем режим при /start
     if user_id in user_settings:
         del user_settings[user_id]
+    # Очищаем pending action
+    user_pending_action.pop(user_id, None)
     
     await update.message.reply_text(
         "👋 Привет! Я расширенный транскрибатор голосовых сообщений с несколькими режимами работы.\n\n"
         "• **Транскрипция** — выдаю транскрипцию, как Телеграм премиум, но бесплатно и с верной пунктуацией.\n\n"
         "• **Косметические изменения** — убираю междометия, разделяю на абзацы и очищаю текст.\n\n"
-        "• **Заметки/сообщения** — более официальный и ёмкий тон. Подойдёт для отправки сообщения коллеге или текстовой заметки для себя.\n\n"
+        "• **Свой промпт** — создай свои правила обработки текста (до 3 промптов).\n\n"
         "Выбери режим, в котором хочешь работать сейчас 👇",
         reply_markup=get_mode_selection_keyboard(),
         parse_mode="Markdown"
@@ -138,6 +162,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def change_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработка кнопки 'Изменить режим'"""
+    user_id = update.effective_user.id
+    # Очищаем pending action при смене режима
+    user_pending_action.pop(user_id, None)
+    
     await update.message.reply_text(
         "Выбери новый режим работы 👇",
         reply_markup=get_mode_selection_keyboard()
@@ -152,21 +180,125 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     
     if query.data.startswith("select:"):
-        # Выбор режима
         new_mode = query.data.split(":")[1]
-        user_settings[user_id] = new_mode
         
+        if new_mode == "custom_prompt":
+            # Проверяем, есть ли сохранённые промпты
+            prompts = user_custom_prompts.get(user_id, [])
+            
+            if prompts:
+                # Показываем список промптов
+                await query.edit_message_text(
+                    "🎯 Выбери свой промпт или создай новый 👇",
+                    reply_markup=get_custom_prompts_keyboard(user_id)
+                )
+            else:
+                # Нет промптов — сразу создаём новый
+                user_pending_action[user_id] = {"action": "awaiting_name"}
+                await query.edit_message_text(
+                    "🎯 У тебя пока нет своих промптов. Давай создадим!\n\n"
+                    "Напиши **название** для нового промпта:",
+                    parse_mode="Markdown"
+                )
+        else:
+            # Обычный режим
+            user_settings[user_id] = new_mode
+            
+            await query.edit_message_text(
+                f"✅ Отлично! Режим «{MODES[new_mode]['short']}» выбран.\n\n"
+                f"{MODES[new_mode]['description']}\n\n"
+                "Теперь отправь мне голосовое сообщение 🎙️",
+                parse_mode="Markdown"
+            )
+            
+            # Добавляем постоянную кнопку смены режима
+            await context.bot.send_message(
+                chat_id=user_id,
+                text="Кнопка для смены режима всегда доступна 👇",
+                reply_markup=get_change_mode_keyboard()
+            )
+    
+    elif query.data.startswith("use_custom:"):
+        # Выбор существующего кастомного промпта
+        idx = int(query.data.split(":")[1])
+        prompts = user_custom_prompts.get(user_id, [])
+        
+        if idx < len(prompts):
+            user_settings[user_id] = f"custom_prompt:{idx}"
+            prompt_name = prompts[idx]["name"]
+            
+            await query.edit_message_text(
+                f"✅ Промпт «{prompt_name}» выбран!\n\n"
+                "Теперь отправь мне голосовое сообщение 🎙️"
+            )
+            
+            await context.bot.send_message(
+                chat_id=user_id,
+                text="Кнопка для смены режима всегда доступна 👇",
+                reply_markup=get_change_mode_keyboard()
+            )
+        else:
+            await query.edit_message_text("❌ Промпт не найден. Попробуй ещё раз.")
+    
+    elif query.data == "new_custom":
+        # Создание нового кастомного промпта
+        prompts = user_custom_prompts.get(user_id, [])
+        
+        if len(prompts) >= MAX_CUSTOM_PROMPTS:
+            await query.edit_message_text(
+                f"❌ Достигнут лимит ({MAX_CUSTOM_PROMPTS} промпта). "
+                "Удали существующий, чтобы создать новый."
+            )
+            return
+        
+        user_pending_action[user_id] = {"action": "awaiting_name"}
         await query.edit_message_text(
-            f"✅ Отлично! Режим «{MODES[new_mode]['short']}» выбран.\n\n"
-            f"{MODES[new_mode]['description']}\n\n"
-            "Теперь отправь мне голосовое сообщение 🎙️",
+            "📝 Напиши **название** для нового промпта:",
             parse_mode="Markdown"
         )
+
+
+async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка текстовых сообщений (для создания кастомных промптов)"""
+    user_id = update.effective_user.id
+    pending = user_pending_action.get(user_id)
+    
+    if not pending:
+        return  # Нет ожидающего действия — игнорируем
+    
+    text = update.message.text.strip()
+    
+    if pending["action"] == "awaiting_name":
+        # Получили название промпта
+        user_pending_action[user_id] = {"action": "awaiting_prompt", "name": text}
+        await update.message.reply_text(
+            f"👍 Название: «{text}»\n\n"
+            "Теперь напиши **текст промпта** — инструкцию, как обрабатывать текст:",
+            parse_mode="Markdown"
+        )
+    
+    elif pending["action"] == "awaiting_prompt":
+        # Получили текст промпта
+        name = pending["name"]
         
-        # Добавляем постоянную кнопку смены режима
-        await context.bot.send_message(
-            chat_id=user_id,
-            text="Кнопка для смены режима всегда доступна 👇",
+        if user_id not in user_custom_prompts:
+            user_custom_prompts[user_id] = []
+        
+        new_idx = len(user_custom_prompts[user_id])
+        user_custom_prompts[user_id].append({"name": name, "prompt": text})
+        
+        # Устанавливаем новый промпт как активный режим
+        user_settings[user_id] = f"custom_prompt:{new_idx}"
+        
+        # Очищаем pending action
+        del user_pending_action[user_id]
+        
+        remaining = MAX_CUSTOM_PROMPTS - len(user_custom_prompts[user_id])
+        
+        await update.message.reply_text(
+            f"✅ Промпт «{name}» создан и выбран!\n\n"
+            f"Осталось свободных слотов: {remaining}/{MAX_CUSTOM_PROMPTS}\n\n"
+            "Теперь отправь мне голосовое сообщение 🎙️",
             reply_markup=get_change_mode_keyboard()
         )
 
@@ -198,7 +330,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         raw_text = await transcribe_audio(bytes(audio_bytes))
         
         # Обрабатываем через LLM
-        result = await process_with_llm(raw_text, mode)
+        result = await process_with_llm(raw_text, mode, user_id=user_id)
         
         # Отправляем результат
         await status_msg.delete()
@@ -221,6 +353,8 @@ def main():
     app.add_handler(MessageHandler(filters.Regex("^🔄 Изменить режим$"), change_mode))
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
+    # Обработка текста для создания кастомных промптов (после всех остальных)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.Regex("^🔄 Изменить режим$"), handle_text_input))
     
     print("🤖 Бот запущен!")
     app.run_polling()
