@@ -303,6 +303,23 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
+async def send_long_message(message, text: str, parse_mode: str = None):
+    """Отправка длинного сообщения частями (лимит Telegram — 4096 символов)"""
+    MAX_LENGTH = 4096
+    
+    if len(text) <= MAX_LENGTH:
+        await message.reply_text(text, parse_mode=parse_mode)
+        return
+    
+    # Разбиваем на части
+    for i in range(0, len(text), MAX_LENGTH):
+        chunk = text[i:i + MAX_LENGTH]
+        try:
+            await message.reply_text(chunk, parse_mode=parse_mode)
+        except Exception:
+            await message.reply_text(chunk)
+
+
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработка голосовых сообщений"""
     user_id = update.effective_user.id
@@ -318,6 +335,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Отправляем статус
     status_msg = await update.message.reply_text("🎙️ Транскрибирую...")
+    status_deleted = False
     
     try:
         # Скачиваем голосовое
@@ -334,15 +352,22 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         # Отправляем результат
         await status_msg.delete()
-        # Используем HTML для правильного отображения форматирования
+        status_deleted = True
+        
+        # Отправляем (с разбивкой на части если текст длинный)
         try:
-            await update.message.reply_text(result, parse_mode="HTML")
+            await send_long_message(update.message, result, parse_mode="HTML")
         except Exception:
-            # Если HTML не парсится, отправляем как обычный текст
-            await update.message.reply_text(result)
+            await send_long_message(update.message, result)
         
     except Exception as e:
-        await status_msg.edit_text(f"❌ Ошибка: {e}")
+        if not status_deleted:
+            try:
+                await status_msg.edit_text(f"❌ Ошибка: {e}")
+            except Exception:
+                await update.message.reply_text(f"❌ Ошибка: {e}")
+        else:
+            await update.message.reply_text(f"❌ Ошибка: {e}")
 
 
 def main():
