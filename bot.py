@@ -1,19 +1,83 @@
 """
 Telegram бот-транскрибатор с режимами обработки и кастомными промптами
-Данные пользователей сохраняются между перезапусками через PicklePersistence.
+Данные пользователей сохраняются в PostgreSQL (через DATABASE_URL).
 """
 import asyncio
+import json
+import os
 import tempfile
 import httpx
+import psycopg2
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler,
-    filters, ContextTypes, PicklePersistence
+    filters, ContextTypes
 )
 
 from config import TELEGRAM_BOT_TOKEN, GROQ_API_KEY, OPENAI_API_KEY
 
 MAX_CUSTOM_PROMPTS = 3
+
+# --- PostgreSQL ---
+
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
+
+
+def get_db():
+    """Получить соединение с PostgreSQL"""
+    return psycopg2.connect(DATABASE_URL)
+
+
+def init_db():
+    """Создать таблицу user_data, если не существует"""
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS user_data (
+                    user_id BIGINT PRIMARY KEY,
+                    data JSONB NOT NULL DEFAULT '{}'
+                )
+            """)
+            conn.commit()
+            # Отладка: показываем содержимое таблицы при старте
+            cur.execute("SELECT user_id, data FROM user_data")
+            rows = cur.fetchall()
+            print(f"📊 БД: найдено {len(rows)} пользователей")
+            for user_id, data in rows:
+                prompts = data.get("custom_prompts", [])
+                mode = data.get("mode", "нет")
+                print(f"   👤 {user_id}: режим={mode}, промптов={len(prompts)}")
+    finally:
+        conn.close()
+
+
+def load_user_data(user_id: int) -> dict:
+    """Загрузить данные пользователя из БД"""
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT data FROM user_data WHERE user_id = %s", (user_id,))
+            row = cur.fetchone()
+            return row[0] if row else {}
+    finally:
+        conn.close()
+
+
+def save_user_data(user_id: int, data: dict):
+    """Сохранить данные пользователя в БД"""
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO user_data (user_id, data)
+                VALUES (%s, %s)
+                ON CONFLICT (user_id) DO UPDATE SET data = EXCLUDED.data
+            """, (user_id, json.dumps(data, ensure_ascii=False)))
+        conn.commit()
+    finally:
+        conn.close()
+
 
 # Глобальная инструкция для всех режимов
 GLOBAL_INSTRUCTION = """
@@ -43,75 +107,81 @@ MODES = {
 }
 
 
-# --- Вспомогательные функции для работы с user_data (персистентность) ---
+# --- Вспомогательные функции для работы с user_data (PostgreSQL) ---
 
-def get_user_mode(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> str | None:
+def get_user_mode(user_id: int) -> str | None:
     """Получить текущий режим пользователя"""
-    return context.application.user_data.get(user_id, {}).get("mode")
+    data = load_user_data(user_id)
+    return data.get("mode")
 
 
-def set_user_mode(context: ContextTypes.DEFAULT_TYPE, user_id: int, mode: str):
+def set_user_mode(user_id: int, mode: str):
     """Установить режим пользователя"""
-    if user_id not in context.application.user_data:
-        context.application.user_data[user_id] = {}
-    context.application.user_data[user_id]["mode"] = mode
+    data = load_user_data(user_id)
+    data["mode"] = mode
+    save_user_data(user_id, data)
 
 
-def clear_user_mode(context: ContextTypes.DEFAULT_TYPE, user_id: int):
+def clear_user_mode(user_id: int):
     """Сбросить режим пользователя"""
-    if user_id in context.application.user_data:
-        context.application.user_data[user_id].pop("mode", None)
+    data = load_user_data(user_id)
+    data.pop("mode", None)
+    save_user_data(user_id, data)
 
 
-def get_custom_prompts(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> list[dict]:
+def get_custom_prompts(user_id: int) -> list[dict]:
     """Получить список кастомных промптов пользователя"""
-    return context.application.user_data.get(user_id, {}).get("custom_prompts", [])
+    data = load_user_data(user_id)
+    return data.get("custom_prompts", [])
 
 
-def add_custom_prompt(context: ContextTypes.DEFAULT_TYPE, user_id: int, name: str, prompt: str) -> int:
+def add_custom_prompt(user_id: int, name: str, prompt: str) -> int:
     """Добавить кастомный промпт и вернуть его индекс"""
-    if user_id not in context.application.user_data:
-        context.application.user_data[user_id] = {}
-    if "custom_prompts" not in context.application.user_data[user_id]:
-        context.application.user_data[user_id]["custom_prompts"] = []
-    prompts = context.application.user_data[user_id]["custom_prompts"]
-    prompts.append({"name": name, "prompt": prompt})
-    return len(prompts) - 1
+    data = load_user_data(user_id)
+    if "custom_prompts" not in data:
+        data["custom_prompts"] = []
+    data["custom_prompts"].append({"name": name, "prompt": prompt})
+    save_user_data(user_id, data)
+    return len(data["custom_prompts"]) - 1
 
 
-def delete_custom_prompt(context: ContextTypes.DEFAULT_TYPE, user_id: int, idx: int) -> bool:
+def delete_custom_prompt(user_id: int, idx: int) -> bool:
     """Удалить кастомный промпт по индексу. Возвращает True если успешно."""
-    prompts = get_custom_prompts(context, user_id)
+    data = load_user_data(user_id)
+    prompts = data.get("custom_prompts", [])
     if 0 <= idx < len(prompts):
         prompts.pop(idx)
         # Если текущий режим указывал на удалённый или сдвинутый промпт — сбрасываем
-        mode = get_user_mode(context, user_id)
+        mode = data.get("mode")
         if mode and mode.startswith("custom_prompt:"):
             old_idx = int(mode.split(":")[1])
             if old_idx == idx:
-                clear_user_mode(context, user_id)
+                data.pop("mode", None)
             elif old_idx > idx:
-                set_user_mode(context, user_id, f"custom_prompt:{old_idx - 1}")
+                data["mode"] = f"custom_prompt:{old_idx - 1}"
+        save_user_data(user_id, data)
         return True
     return False
 
 
-def get_pending_action(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> dict | None:
+def get_pending_action(user_id: int) -> dict | None:
     """Получить pending action пользователя"""
-    return context.application.user_data.get(user_id, {}).get("pending_action")
+    data = load_user_data(user_id)
+    return data.get("pending_action")
 
 
-def set_pending_action(context: ContextTypes.DEFAULT_TYPE, user_id: int, action: dict):
+def set_pending_action(user_id: int, action: dict):
     """Установить pending action"""
-    if user_id not in context.application.user_data:
-        context.application.user_data[user_id] = {}
-    context.application.user_data[user_id]["pending_action"] = action
+    data = load_user_data(user_id)
+    data["pending_action"] = action
+    save_user_data(user_id, data)
 
 
-def clear_pending_action(context: ContextTypes.DEFAULT_TYPE, user_id: int):
+def clear_pending_action(user_id: int):
     """Очистить pending action"""
-    if user_id in context.application.user_data:
-        context.application.user_data[user_id].pop("pending_action", None)
+    data = load_user_data(user_id)
+    data.pop("pending_action", None)
+    save_user_data(user_id, data)
 
 
 # --- Основные функции бота ---
@@ -129,12 +199,12 @@ async def transcribe_audio(audio_bytes: bytes) -> str:
         return response.json()["text"]
 
 
-async def process_with_llm(text: str, mode: str, context: ContextTypes.DEFAULT_TYPE = None, user_id: int = None) -> str:
+async def process_with_llm(text: str, mode: str, user_id: int = None) -> str:
     """Обработка текста через Groq LLM"""
     if mode.startswith("custom_prompt:"):
         # Кастомный промпт — берём из пользовательских данных
         idx = int(mode.split(":")[1])
-        prompts = get_custom_prompts(context, user_id)
+        prompts = get_custom_prompts(user_id)
         if idx < len(prompts):
             user_prompt = prompts[idx]["prompt"]
         else:
@@ -174,10 +244,10 @@ def get_mode_selection_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(buttons)
 
 
-def get_custom_prompts_keyboard(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> InlineKeyboardMarkup:
+def get_custom_prompts_keyboard(user_id: int) -> InlineKeyboardMarkup:
     """Клавиатура выбора кастомного промпта"""
     buttons = []
-    prompts = get_custom_prompts(context, user_id)
+    prompts = get_custom_prompts(user_id)
     
     for i, p in enumerate(prompts):
         buttons.append([InlineKeyboardButton(
@@ -215,9 +285,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     
     # Сбрасываем режим при /start
-    clear_user_mode(context, user_id)
+    clear_user_mode(user_id)
     # Очищаем pending action
-    clear_pending_action(context, user_id)
+    clear_pending_action(user_id)
     
     await update.message.reply_text(
         "👋 Привет! Я расширенный транскрибатор голосовых сообщений с несколькими режимами работы.\n\n"
@@ -234,7 +304,7 @@ async def change_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработка кнопки 'Изменить режим'"""
     user_id = update.effective_user.id
     # Очищаем pending action при смене режима
-    clear_pending_action(context, user_id)
+    clear_pending_action(user_id)
     
     await update.message.reply_text(
         "Выбери новый режим работы 👇",
@@ -254,17 +324,17 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         if new_mode == "custom_prompt":
             # Проверяем, есть ли сохранённые промпты
-            prompts = get_custom_prompts(context, user_id)
+            prompts = get_custom_prompts(user_id)
             
             if prompts:
                 # Показываем список промптов
                 await query.edit_message_text(
                     "🎯 Выбери свой промпт или создай новый 👇",
-                    reply_markup=get_custom_prompts_keyboard(context, user_id)
+                    reply_markup=get_custom_prompts_keyboard(user_id)
                 )
             else:
                 # Нет промптов — сразу создаём новый
-                set_pending_action(context, user_id, {"action": "awaiting_name"})
+                set_pending_action(user_id, {"action": "awaiting_name"})
                 await query.edit_message_text(
                     "🎯 У тебя пока нет своих промптов. Давай создадим!\n\n"
                     "Напиши **название** для нового промпта:",
@@ -272,7 +342,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
         else:
             # Обычный режим
-            set_user_mode(context, user_id, new_mode)
+            set_user_mode(user_id, new_mode)
             
             await query.edit_message_text(
                 f"✅ Отлично! Режим «{MODES[new_mode]['short']}» выбран.\n\n"
@@ -291,10 +361,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif query.data.startswith("use_custom:"):
         # Выбор существующего кастомного промпта
         idx = int(query.data.split(":")[1])
-        prompts = get_custom_prompts(context, user_id)
+        prompts = get_custom_prompts(user_id)
         
         if idx < len(prompts):
-            set_user_mode(context, user_id, f"custom_prompt:{idx}")
+            set_user_mode(user_id, f"custom_prompt:{idx}")
             prompt_name = prompts[idx]["name"]
             
             await query.edit_message_text(
@@ -312,7 +382,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     elif query.data == "new_custom":
         # Создание нового кастомного промпта
-        prompts = get_custom_prompts(context, user_id)
+        prompts = get_custom_prompts(user_id)
         
         if len(prompts) >= MAX_CUSTOM_PROMPTS:
             await query.edit_message_text(
@@ -321,7 +391,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
         
-        set_pending_action(context, user_id, {"action": "awaiting_name"})
+        set_pending_action(user_id, {"action": "awaiting_name"})
         await query.edit_message_text(
             "📝 Напиши **название** для нового промпта:",
             parse_mode="Markdown"
@@ -329,7 +399,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     elif query.data == "delete_custom":
         # Показываем список промптов для удаления
-        prompts = get_custom_prompts(context, user_id)
+        prompts = get_custom_prompts(user_id)
         
         if not prompts:
             await query.edit_message_text("У тебя нет сохранённых промптов.")
@@ -354,25 +424,25 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif query.data.startswith("delete_confirm:"):
         # Удаление конкретного промпта
         idx = int(query.data.split(":")[1])
-        prompts = get_custom_prompts(context, user_id)
+        prompts = get_custom_prompts(user_id)
         
         if idx < len(prompts):
             deleted_name = prompts[idx]["name"]
-            delete_custom_prompt(context, user_id, idx)
+            delete_custom_prompt(user_id, idx)
             
             # Возвращаем в меню "Свой промпт"
-            remaining_prompts = get_custom_prompts(context, user_id)
+            remaining_prompts = get_custom_prompts(user_id)
             if remaining_prompts:
                 await query.edit_message_text(
                     f"✅ Промпт «{deleted_name}» удалён.\n\n"
                     "Выбери промпт или создай новый 👇",
-                    reply_markup=get_custom_prompts_keyboard(context, user_id)
+                    reply_markup=get_custom_prompts_keyboard(user_id)
                 )
             else:
                 await query.edit_message_text(
                     f"✅ Промпт «{deleted_name}» удалён.\n\n"
                     "У тебя больше нет сохранённых промптов.",
-                    reply_markup=get_custom_prompts_keyboard(context, user_id)
+                    reply_markup=get_custom_prompts_keyboard(user_id)
                 )
         else:
             await query.edit_message_text("❌ Промпт не найден.")
@@ -381,7 +451,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработка текстовых сообщений (для создания кастомных промптов)"""
     user_id = update.effective_user.id
-    pending = get_pending_action(context, user_id)
+    pending = get_pending_action(user_id)
     
     if not pending:
         return  # Нет ожидающего действия — игнорируем
@@ -390,7 +460,7 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if pending["action"] == "awaiting_name":
         # Получили название промпта
-        set_pending_action(context, user_id, {"action": "awaiting_prompt", "name": text})
+        set_pending_action(user_id, {"action": "awaiting_prompt", "name": text})
         await update.message.reply_text(
             f"👍 Название: «{text}»\n\n"
             "Теперь напиши **текст промпта** — инструкцию, как обрабатывать текст:",
@@ -401,15 +471,15 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Получили текст промпта
         name = pending["name"]
         
-        new_idx = add_custom_prompt(context, user_id, name, text)
+        new_idx = add_custom_prompt(user_id, name, text)
         
         # Устанавливаем новый промпт как активный режим
-        set_user_mode(context, user_id, f"custom_prompt:{new_idx}")
+        set_user_mode(user_id, f"custom_prompt:{new_idx}")
         
         # Очищаем pending action
-        clear_pending_action(context, user_id)
+        clear_pending_action(user_id)
         
-        remaining = MAX_CUSTOM_PROMPTS - len(get_custom_prompts(context, user_id))
+        remaining = MAX_CUSTOM_PROMPTS - len(get_custom_prompts(user_id))
         
         await update.message.reply_text(
             f"✅ Промпт «{name}» создан и выбран!\n\n"
@@ -439,7 +509,7 @@ async def send_long_message(message, text: str, parse_mode: str = None):
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработка голосовых сообщений"""
     user_id = update.effective_user.id
-    mode = get_user_mode(context, user_id)
+    mode = get_user_mode(user_id)
     
     # Если режим не выбран, просим выбрать
     if mode is None:
@@ -464,7 +534,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         raw_text = await transcribe_audio(bytes(audio_bytes))
         
         # Обрабатываем через LLM
-        result = await process_with_llm(raw_text, mode, context=context, user_id=user_id)
+        result = await process_with_llm(raw_text, mode, user_id=user_id)
         
         # Отправляем результат
         await status_msg.delete()
@@ -488,10 +558,10 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     """Запуск бота"""
-    # Персистентность: данные сохраняются в файл и загружаются при старте
-    persistence = PicklePersistence(filepath="bot_data.pickle")
+    # Инициализируем таблицу в PostgreSQL
+    init_db()
     
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).persistence(persistence).build()
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.Regex("^🔄 Изменить режим$"), change_mode))
