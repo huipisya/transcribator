@@ -79,6 +79,23 @@ def add_custom_prompt(context: ContextTypes.DEFAULT_TYPE, user_id: int, name: st
     return len(prompts) - 1
 
 
+def delete_custom_prompt(context: ContextTypes.DEFAULT_TYPE, user_id: int, idx: int) -> bool:
+    """Удалить кастомный промпт по индексу. Возвращает True если успешно."""
+    prompts = get_custom_prompts(context, user_id)
+    if 0 <= idx < len(prompts):
+        prompts.pop(idx)
+        # Если текущий режим указывал на удалённый или сдвинутый промпт — сбрасываем
+        mode = get_user_mode(context, user_id)
+        if mode and mode.startswith("custom_prompt:"):
+            old_idx = int(mode.split(":")[1])
+            if old_idx == idx:
+                clear_user_mode(context, user_id)
+            elif old_idx > idx:
+                set_user_mode(context, user_id, f"custom_prompt:{old_idx - 1}")
+        return True
+    return False
+
+
 def get_pending_action(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> dict | None:
     """Получить pending action пользователя"""
     return context.application.user_data.get(user_id, {}).get("pending_action")
@@ -173,6 +190,13 @@ def get_custom_prompts_keyboard(context: ContextTypes.DEFAULT_TYPE, user_id: int
         buttons.append([InlineKeyboardButton(
             "➕ Создать новый промпт", 
             callback_data="new_custom"
+        )])
+    
+    # Кнопка "Удалить промпт" — только если есть что удалять
+    if prompts:
+        buttons.append([InlineKeyboardButton(
+            "🗑 Удалить промпт", 
+            callback_data="delete_custom"
         )])
     
     return InlineKeyboardMarkup(buttons)
@@ -302,6 +326,56 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "📝 Напиши **название** для нового промпта:",
             parse_mode="Markdown"
         )
+    
+    elif query.data == "delete_custom":
+        # Показываем список промптов для удаления
+        prompts = get_custom_prompts(context, user_id)
+        
+        if not prompts:
+            await query.edit_message_text("У тебя нет сохранённых промптов.")
+            return
+        
+        buttons = []
+        for i, p in enumerate(prompts):
+            buttons.append([InlineKeyboardButton(
+                f"🗑 {p['name']}",
+                callback_data=f"delete_confirm:{i}"
+            )])
+        buttons.append([InlineKeyboardButton(
+            "↩️ Назад",
+            callback_data="select:custom_prompt"
+        )])
+        
+        await query.edit_message_text(
+            "Какой промпт удалить? 👇",
+            reply_markup=InlineKeyboardMarkup(buttons)
+        )
+    
+    elif query.data.startswith("delete_confirm:"):
+        # Удаление конкретного промпта
+        idx = int(query.data.split(":")[1])
+        prompts = get_custom_prompts(context, user_id)
+        
+        if idx < len(prompts):
+            deleted_name = prompts[idx]["name"]
+            delete_custom_prompt(context, user_id, idx)
+            
+            # Возвращаем в меню "Свой промпт"
+            remaining_prompts = get_custom_prompts(context, user_id)
+            if remaining_prompts:
+                await query.edit_message_text(
+                    f"✅ Промпт «{deleted_name}» удалён.\n\n"
+                    "Выбери промпт или создай новый 👇",
+                    reply_markup=get_custom_prompts_keyboard(context, user_id)
+                )
+            else:
+                await query.edit_message_text(
+                    f"✅ Промпт «{deleted_name}» удалён.\n\n"
+                    "У тебя больше нет сохранённых промптов.",
+                    reply_markup=get_custom_prompts_keyboard(context, user_id)
+                )
+        else:
+            await query.edit_message_text("❌ Промпт не найден.")
 
 
 async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
